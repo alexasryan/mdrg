@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Nexus Messenger — страница не найдена</title>
+    <style>
+      body { font-family: system-ui, sans-serif; display: grid; place-items: center; min-height: 100vh; margin: 0; background: #f8fafc; color: #0f172a; }
+      .card { text-align: center; padding: 2rem; }
+      a { color: #487bee; }
+      @media (prefers-color-scheme: dark) { body { background: #0b1220; color: #e2e8f0; } }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>404</h1>
+      <p>Страница не найдена.</p>
+      <p><a id="home" href="./">Перейти в Nexus Messenger</a></p>
+      <script>
+        var p = location.pathname;
+        var base = p.replace(/\/404\.html$/, '/');
+        document.getElementById('home').href = base;
+      </script>
+    </div>
+  </body>
+</html>
