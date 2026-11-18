@@ -99,7 +99,7 @@ export interface SignalMessage {
   room_id: string;
   sender_peer: string;
   target_peer: string | null;
-  payload: { type: 'offer' | 'answer' | 'ice' | 'leave' | 'ping'; sdp?: string; candidate?: unknown };
+  payload: { type: 'offer' | 'answer' | 'ice' | 'leave' | 'ping' | 'ready'; sdp?: string; candidate?: unknown };
   created_at: string;
 }
 

@@ -132,7 +132,7 @@ export default function HomePage() {
         <div className="scroll-thin flex-1 overflow-y-auto px-2 pb-4">
           {offline && (
             <div className="mx-2 mb-2 flex items-center gap-2 rounded-xl bg-amber-100 px-3 py-2 text-xs text-amber-800 dark:bg-amber-900/40 dark:text-amber-300">
-              <WifiOff className="h-4 w-4 shrink-0" aria-hidden /> Нет соединения — сообщения будут отправлены после восстановления связи
+              <WifiOff className="h-4 w-4 shrink-0" aria-hidden /> Нет соединения — проверьте сеть перед отправкой сообщения
             </div>
           )}
           {tab === 'chats' && <ChatsList chats={filteredChats} userId={userId} loading={chats === null} onOpen={(id) => navigate(`/chat/${id}`)} />}
@@ -343,14 +343,15 @@ function ChatView({ chatId, me, onBack, onToast }: { chatId: string; me: string;
 
   async function send() {
     const content = text.trim();
-    if ((!content && !replyTo) || sending) return;
+    if (!content || sending) return;
+    if (content.length > APP_CONFIG.limits.maxMessageLength) return onToast('Сообщение слишком длинное');
     setSending(true);
     setText('');
     const replying = replyTo;
     setReplyTo(null);
     try {
       const m = await backend.sendMessage(chatId, me, content, replying?.id ?? null, null);
-      setMessages((p) => [...p, m]);
+      setMessages((p) => p.some(x => x.id === m.id) ? p : [...p, m]);
     } catch (e) {
       onToast('Ошибка отправки: ' + (e as Error).message);
       setText(content);
@@ -366,15 +367,16 @@ function ChatView({ chatId, me, onBack, onToast }: { chatId: string; me: string;
       return;
     }
     setUploadProgress(0);
-    const res = await backend.uploadChatFile(chatId, me, file, (p) => setUploadProgress(p));
-    setUploadProgress(null);
-    if ('error' in res) return onToast(res.error);
     try {
+      const res = await backend.uploadChatFile(chatId, me, file, (p) => setUploadProgress(p));
+      if ('error' in res) return onToast(res.error);
       const m = await backend.sendMessage(chatId, me, '', null, res);
-      setMessages((p) => [...p, m]);
+      setMessages((p) => p.some(x => x.id === m.id) ? p : [...p, m]);
       void reloadChat();
     } catch (e) {
       onToast('Ошибка отправки файла: ' + (e as Error).message);
+    } finally {
+      setUploadProgress(null);
     }
   }
 
@@ -491,6 +493,7 @@ function ChatView({ chatId, me, onBack, onToast }: { chatId: string; me: string;
             rows={1}
             className="input max-h-32 min-h-[44px] flex-1 resize-none !py-2.5"
             placeholder="Сообщение…"
+            maxLength={APP_CONFIG.limits.maxMessageLength}
             value={text}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send(); } }}

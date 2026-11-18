@@ -28,7 +28,7 @@ export function CallProvider({ userId, children }: { userId: string | null; chil
     });
     // если звонок уже принят/отклонён собеседником — снять "входящий"
     const unsub2 = backend.subscribeCallUpdates(userId, (c) => {
-      setIncoming((cur) => (cur && cur.callId === c.id && (c.status === 'declined' || c.status === 'missed') ? null : cur));
+      setIncoming((cur) => (cur && cur.callId === c.id && (c.status !== 'ringing') ? null : cur));
     });
     return () => {
       unsub();

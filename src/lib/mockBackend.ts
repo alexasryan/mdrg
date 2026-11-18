@@ -51,59 +51,64 @@ async function hashPassword(pw: string): Promise<string> {
 type BcSender = () => BroadcastChannel | null;
 
 export class MockBackend implements BackendApi {
-  private bc: BcSender;
+  private channel: BroadcastChannel | null;
+  private ready: Promise<void>;
   private listeners = new Map<string, Set<(data: unknown) => void>>();
 
   constructor(bc: BcSender) {
-    this.bc = bc;
-    const chan = this.bc();
+    const chan = this.channel = bc();
     if (chan) {
       chan.onmessage = (ev) => {
         const { t, key } = ev.data ?? {};
         if (t === 'store-update') {
-          this.listeners.get(key)?.forEach((cb) => cb(ev.data));
+          if (key !== 'auth') this.listeners.get(key)?.forEach((cb) => cb(ev.data));
         }
       };
     }
-    this.seed();
+    this.ready = this.seed();
   }
 
-  private seed() {
+  private async seed() {
     if (load(LS.profiles, {} as Record<string, Profile>) && Object.keys(load(LS.profiles, {})).length) return;
+    const passwordHash = await hashPassword('demo1234');
+    // Another tab may have initialized the shared store while hashing.
+    if (Object.keys(load(LS.profiles, {})).length) return;
     const now = new Date().toISOString();
     const p1: Profile = { id: uid(), display_name: 'Анна Смирнова', username: 'anna', avatar_url: null, status_text: 'Привет! Я использую Nexus', is_online: true, last_seen: now, created_at: now };
     const p2: Profile = { id: uid(), display_name: 'Иван Петров', username: 'ivan', avatar_url: null, status_text: '', is_online: false, last_seen: now, created_at: now };
     save(LS.profiles, { [p1.id]: p1, [p2.id]: p2 });
     const users = [
-      { email: 'anna@demo.local', passwordHash: '', id: p1.id },
-      { email: 'ivan@demo.local', passwordHash: '', id: p2.id },
+      { email: 'anna@demo.local', passwordHash, id: p1.id },
+      { email: 'ivan@demo.local', passwordHash, id: p2.id },
     ];
     save(LS.users, users);
-    // пароли демо-пользователей: demo1234 (хеш ставится асинхронно ниже)
-    void hashPassword('demo1234').then((h) => {
-      const us = load<typeof users>(LS.users, []);
-      us.forEach((u) => (u.passwordHash = h));
-      save(LS.users, us);
-    });
   }
 
   private notify(key: string, extra?: Record<string, unknown>) {
-    save(LS.session, this.currentUserId());
-    this.bc()?.postMessage({ t: 'store-update', key, ...extra });
+    const event = { t: 'store-update', key, ...extra };
+    this.listeners.get(key)?.forEach(cb => cb(event));
+    this.channel?.postMessage(event);
   }
 
   private currentUserId(): string | null {
-    return load<string | null>(LS.session, null);
+    try { return JSON.parse(sessionStorage.getItem(LS.session) ?? 'null') as string | null; }
+    catch { return null; }
+  }
+
+  private setSession(id: string | null) {
+    sessionStorage.setItem(LS.session, JSON.stringify(id));
   }
 
   // ---------- auth ----------
   async getSessionUserId() {
+    await this.ready;
     return this.currentUserId();
   }
   async getProfile(userId: string) {
     return load<Record<string, Profile>>(LS.profiles, {})[userId] ?? null;
   }
   async signUp(email: string, password: string, displayName: string, username: string) {
+    await this.ready;
     const users = load<{ email: string; passwordHash: string; id: string }[]>(LS.users, []);
     if (users.some((u) => u.email.toLowerCase() === email.toLowerCase())) {
       return { error: 'Пользователь с таким e-mail уже зарегистрирован', needsConfirmation: false };
@@ -126,16 +131,17 @@ export class MockBackend implements BackendApi {
     users.push({ email: email.toLowerCase(), passwordHash: await hashPassword(password), id });
     save(LS.profiles, profiles);
     save(LS.users, users);
-    save(LS.session, id);
+    this.setSession(id);
     this.notify('auth');
     return { needsConfirmation: false };
   }
   async signIn(email: string, password: string) {
+    await this.ready;
     const users = load<{ email: string; passwordHash: string; id: string }[]>(LS.users, []);
     const u = users.find((x) => x.email === email.toLowerCase());
     const h = await hashPassword(password);
     if (!u || u.passwordHash !== h) return { error: 'Неверный e-mail или пароль' };
-    save(LS.session, u.id);
+    this.setSession(u.id);
     const profiles = load<Record<string, Profile>>(LS.profiles, {});
     if (profiles[u.id]) {
       profiles[u.id].is_online = true;
@@ -147,7 +153,7 @@ export class MockBackend implements BackendApi {
   async signOut() {
     const id = this.currentUserId();
     if (id) await this.setPresence(id, false);
-    save(LS.session, null);
+    this.setSession(null);
     this.notify('auth');
   }
   async resetPassword(_email: string) {
@@ -341,7 +347,7 @@ export class MockBackend implements BackendApi {
     const call: Call = {
       id: uid(),
       chat_id: chatId,
-      room_id: null,
+      room_id: busy ? null : (await this.createRoom(callerId, 'Личный звонок', mode)).id,
       caller_id: callerId,
       callee_id: calleeId,
       mode,
@@ -351,7 +357,10 @@ export class MockBackend implements BackendApi {
     };
     calls.push(call);
     save(LS.calls, calls);
-    if (!busy) {
+    if (!busy && call.room_id) {
+      const rooms = load<CallRoom[]>(LS.rooms, []);
+      rooms.find(r => r.id === call.room_id)!.max_participants = 2;
+      save(LS.rooms, rooms);
       this.notify('call-events:' + calleeId, {
         event: { id: Date.now(), callee_id: calleeId, caller_user_id: callerId, call_id: call.id, mode, created_at: call.created_at },
       } as unknown as Record<string, unknown>);
@@ -503,7 +512,7 @@ export class MockBackend implements BackendApi {
     parts = parts.filter((p) => p.id !== participantId);
     save(LS.roomParts, parts);
     const remaining = parts.filter((p) => p.room_id === roomId && Date.now() - new Date(p.last_active).getTime() < 90_000);
-    if (!remaining.length) this.updateRoomStatus(roomId, 'ended');
+    if (!remaining.length) this.updateRoomStatus(roomId, 'waiting');
     this.notify('room:' + roomId);
   }
   async heartbeat(roomId: string, participantId: string) {
@@ -512,9 +521,9 @@ export class MockBackend implements BackendApi {
     if (p) {
       p.last_active = new Date().toISOString();
       save(LS.roomParts, parts);
+      this.updateRoomStatus(roomId, 'active');
       this.notify('room:' + roomId);
     }
-    void roomId;
   }
   async listParticipants(roomId: string) {
     const profiles = load<Record<string, Profile>>(LS.profiles, {});

@@ -31,7 +31,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
 
   const loadProfile = useCallback(async (id: string) => {
-    const p = await backend.getProfile(id);
+    const p = await backend.getProfile(id).catch(() => null);
     setProfile(p);
   }, []);
 
@@ -42,6 +42,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setUserId(id);
       setLoading(false);
       if (id) void loadProfile(id);
+    }).catch(() => {
+      if (mounted) { setUserId(null); setProfile(null); setLoading(false); }
     });
     const unsub = backend.onAuthChange((id) => {
       setUserId(id);

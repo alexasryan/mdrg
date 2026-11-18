@@ -1,5 +1,5 @@
 import { Component, type ReactNode, useEffect } from 'react';
-import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
+import { HashRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { APP_CONFIG } from './config';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { SettingsProvider } from './hooks/useSettings';
@@ -57,18 +57,20 @@ function Shell() {
   if (loading) return <FullscreenLoader />;
   return (
     <>
+      <CallProvider userId={user?.id ?? null}>
       {user && <IncomingCallBanner />}
       <Routes>
-        <Route path="/" element={<Protected><CallProvider userId={user!.id}><HomePage /></CallProvider></Protected>} />
-        <Route path="/chat/:chatId" element={<Protected><CallProvider userId={user!.id}><HomePage /></CallProvider></Protected>} />
+        <Route path="/" element={<Protected><HomePage /></Protected>} />
+        <Route path="/chat/:chatId" element={<Protected><HomePage /></Protected>} />
         <Route path="/settings" element={<Protected><SettingsPage /></Protected>} />
         <Route path="/create-call" element={<Protected><CreateCallPage /></Protected>} />
         <Route path="/auth" element={user ? <Navigate to="/" replace /> : <AuthPage />} />
         {/* комнаты и прямые звонки доступны гостям без авторизации */}
-        <Route path="/room/:id" element={<RoomPage />} />
-        <Route path="/call/:id" element={<RoomPage />} />
+        <Route path="/room/:id" element={<RoomPage key={location.pathname} />} />
+        <Route path="/call/:id" element={<RoomPage key={location.pathname} />} />
         <Route path="*" element={<NotFoundPage />} />
       </Routes>
+      </CallProvider>
     </>
   );
 }
@@ -76,13 +78,13 @@ function Shell() {
 export default function App() {
   return (
     <ErrorBoundary>
-      <BrowserRouter basename={import.meta.env.BASE_URL.replace(/\/$/, '')}>
+      <HashRouter>
         <SettingsProvider>
           <AuthProvider>
             <Shell />
           </AuthProvider>
         </SettingsProvider>
-      </BrowserRouter>
+      </HashRouter>
     </ErrorBoundary>
   );
 }

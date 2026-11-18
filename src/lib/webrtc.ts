@@ -9,10 +9,12 @@ export type SignalPayload =
   | { type: 'offer'; sdp: string }
   | { type: 'answer'; sdp: string }
   | { type: 'ice'; candidate: RTCIceCandidateInit }
-  | { type: 'leave' };
+  | { type: 'leave' }
+  | { type: 'ready' };
 
 export interface SignalTransport {
   send(from: string, to: string | null, payload: SignalPayload): Promise<void>;
+  close?(): void;
   subscribe(selfPeer: string, cb: (from: string, payload: SignalPayload) => void): () => void;
 }
 
@@ -28,6 +30,7 @@ export class CallManager {
   private onRemoteStream?: (peerId: string, s: MediaStream | null) => void;
   private onPeerState?: (peerId: string, state: PeerState) => void;
   private closed = false;
+  private pendingIce = new Map<string, RTCIceCandidateInit[]>();
   private transportUnsub: (() => void) | null = null;
 
   constructor(
@@ -52,6 +55,10 @@ export class CallManager {
       audio: { echoCancellation: true, noiseSuppression: true },
       video: video ? { width: { ideal: 1280 }, height: { ideal: 720 } } : false,
     });
+    if (this.closed) {
+      stream.getTracks().forEach(t => t.stop());
+      throw new Error('Звонок завершён');
+    }
     this.localStream = stream;
     this.onLocalStream?.(stream);
     return stream;
@@ -63,12 +70,14 @@ export class CallManager {
 
   start(): void {
     if (this.closed) return;
-    this.transportUnsub = this.transport.subscribe(this.selfPeer, (from, payload) => this.handleSignal(from, payload));
+    this.transportUnsub = this.transport.subscribe(this.selfPeer, (from, payload) => { void this.handleSignal(from, payload); });
+    void this.transport.send(this.selfPeer, null, { type: 'ready' });
   }
 
   /** Вызывается при появлении нового участника комнаты */
   async handlePeerJoined(peerId: string): Promise<void> {
     if (peerId === this.selfPeer || this.closed || !this.localStream) return;
+    if (this.pcMap.has(peerId)) return;
     // детерминированно: offer отправляет тот, чей id меньше в паре
     const weOffer = this.selfPeer < peerId;
     this.makeOffer[peerId] = weOffer;
@@ -134,6 +143,7 @@ export class CallManager {
 
   private async handleSignal(from: string, payload: SignalPayload) {
     if (this.closed) return;
+    if (payload.type === 'ready') { await this.handlePeerJoined(from); return; }
     const pc = this.pcMap.get(from) ?? (payload.type !== 'leave' ? this.createPCWithTracks(from) : undefined);
     if (!pc && payload.type !== 'leave') return;
     try {
@@ -141,6 +151,7 @@ export class CallManager {
         case 'offer': {
           this.makeOffer[from] = false;
           await pc!.setRemoteDescription({ type: 'offer', sdp: payload.sdp });
+          await this.flushIce(from, pc!);
           const answer = await pc!.createAnswer();
           await pc!.setLocalDescription(answer);
           await this.transport.send(this.selfPeer, from, { type: 'answer', sdp: answer.sdp! });
@@ -148,13 +159,11 @@ export class CallManager {
         }
         case 'answer':
           await pc!.setRemoteDescription({ type: 'answer', sdp: payload.sdp });
+          await this.flushIce(from, pc!);
           break;
         case 'ice':
-          try {
-            await pc!.addIceCandidate(payload.candidate);
-          } catch {
-            // кандидат мог прийти раньше remote description — игнорируем безопасно
-          }
+          if (pc!.remoteDescription) await pc!.addIceCandidate(payload.candidate);
+          else this.pendingIce.set(from, [...(this.pendingIce.get(from) ?? []), payload.candidate]);
           break;
         case 'leave':
           this.handlePeerLeft(from);
@@ -163,6 +172,12 @@ export class CallManager {
     } catch (e) {
       console.error('signal handling error', e);
     }
+  }
+
+  private async flushIce(peer: string, pc: RTCPeerConnection) {
+    const candidates = this.pendingIce.get(peer) ?? [];
+    this.pendingIce.delete(peer);
+    for (const candidate of candidates) await pc.addIceCandidate(candidate);
   }
 
   /** PC созданная "в ответ" на сигнал — тоже нужно добавить треки */
@@ -223,6 +238,8 @@ export class CallManager {
       /* сеть могла отвалиться — всё равно очищаем локально */
     }
     this.transportUnsub?.();
+    this.transport.close?.();
+    this.pendingIce.clear();
     for (const id of [...this.pcMap.keys()]) this.closePC(id);
     this.localStream?.getTracks().forEach((t) => t.stop());
     this.localStream = null;

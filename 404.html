@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="ru">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Nexus Messenger</title></head>
+<body>
+<p>Открываем Nexus Messenger… <a href="/mdrg/">Перейти в приложение</a></p>
+<script>
+// Preserve old BrowserRouter links while new links use hash routing on Pages.
+var base = '/mdrg/';
+var route = location.pathname.startsWith(base) ? location.pathname.slice(base.length) : '';
+location.replace(base + '#/' + route + location.search);
+</script>
+</body>
+</html>

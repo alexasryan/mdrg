@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ArrowLeft, Monitor, Moon, Sun, Bell, Volume2, Camera, LogOut, Check } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
@@ -18,6 +18,10 @@ export default function SettingsPage() {
   const [saved, setSaved] = useState(false);
   const [busy, setBusy] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    setName(profile?.display_name ?? '');
+    setStatus(profile?.status_text ?? '');
+  }, [profile?.id]);
 
   async function saveProfile() {
     if (!profile) return;

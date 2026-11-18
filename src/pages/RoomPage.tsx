@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { Mic, MicOff, Video as VideoIcon, VideoOff, PhoneOff, Maximize, Minimize, Users, SwitchCamera, Copy, Share2, Wifi, WifiOff, ShieldAlert, Loader2, LogIn, ArrowLeft } from 'lucide-react';
+import { Mic, MicOff, Video as VideoIcon, VideoOff, PhoneOff, Maximize, Minimize, Users, SwitchCamera, Copy, Wifi, WifiOff, ShieldAlert, Loader2, LogIn, ArrowLeft } from 'lucide-react';
 import { backend } from '../lib/backend';
 import { CallManager, type SignalTransport, type PeerState } from '../lib/webrtc';
 import { APP_CONFIG, buildInviteLink } from '../config';
 import { formatDuration } from '../utils/format';
-import { copyToClipboard, nativeShare } from '../utils/format';
+import { copyToClipboard } from '../utils/format';
 import { Avatar, Spinner } from '../components/ui';
 import { guestNameSchema, validate } from '../lib/validation';
 import { isSupabaseConfigured } from '../lib/supabase';
@@ -13,9 +13,10 @@ import type { CallRoom, RoomParticipant } from '../types';
 
 /* ---------- транспорты сигнализации ---------- */
 
-function makeBcTransport(): SignalTransport {
-  const ch = new BroadcastChannel('nexus-signaling');
+function makeBcTransport(roomId: string): SignalTransport {
+  const ch = new BroadcastChannel('nexus-signaling:' + roomId);
   return {
+    close: () => ch.close(),
     async send(from, to, payload) {
       ch.postMessage({ from, to, payload });
     },
@@ -25,7 +26,7 @@ function makeBcTransport(): SignalTransport {
         if (d?.from !== selfPeer && (d?.to === null || d?.to === selfPeer)) cb(d.from, d.payload);
       };
       ch.addEventListener('message', h);
-      return () => ch.removeEventListener('message', h);
+      return () => { ch.removeEventListener('message', h); ch.close(); };
     },
   };
 }
@@ -65,7 +66,7 @@ function makeSbTransport(roomId: string): SignalTransport {
 
 /** id пира для 1:1 звонка через "комнату" call-<callId> */
 function transportFor(roomId: string): SignalTransport {
-  return isSupabaseConfigured ? makeSbTransport(roomId) : makeBcTransport();
+  return isSupabaseConfigured ? makeSbTransport(roomId) : makeBcTransport(roomId);
 }
 
 /* ---------- основной экран звонка ---------- */
@@ -100,6 +101,13 @@ export default function RoomPage() {
   const [seconds, setSeconds] = useState(0);
   const [fullscreen, setFullscreen] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [tinyNotice, setTinyNotice] = useState('');
+  const cleanupFns = useRef<Array<() => void>>([]);
+  const participantRef = useRef('');
+  const activeRoomRef = useRef(roomId);
+  const mountedRef = useRef(true);
+  const [dataRoomId, setDataRoomId] = useState(roomId);
+  const joiningRef = useRef(false);
   const [cameras, setCameras] = useState<MediaDeviceInfo[]>([]);
 
   const managerRef = useRef<CallManager | null>(null);
@@ -118,6 +126,8 @@ export default function RoomPage() {
           const call = await backend.getCall(callId);
           if (!mounted) return;
           if (!call) return setError('Ссылка на звонок недействительна или звонок завершён');
+          if (!call.room_id || !['ringing', 'accepted'].includes(call.status)) return setError('Звонок завершён');
+          setDataRoomId(call.room_id);
           const metaRaw = sessionStorage.getItem('nexus-active-call');
           const meta: ActiveCallMeta | null = metaRaw ? JSON.parse(metaRaw) : null;
           if (!meta || meta.callId !== callId) {
@@ -151,24 +161,24 @@ export default function RoomPage() {
   }, [roomId, isDirect, callId]);
 
   const refreshParticipants = useCallback(async () => {
-    const list = await backend.listParticipants(roomId);
+    const list = await backend.listParticipants(dataRoomId);
     setParticipants(list);
-  }, [roomId]);
+  }, [dataRoomId]);
 
   // подписка на изменения состава + heartbeat
   useEffect(() => {
     if (phase !== 'in-call') return;
     void refreshParticipants();
-    const unsub = backend.subscribeRoom(roomId, () => void refreshParticipants());
+    const unsub = backend.subscribeRoom(dataRoomId, () => void refreshParticipants());
     hbRef.current = window.setInterval(async () => {
       const p = myPeer;
-      if (p) await backend.heartbeat(roomId, p).catch(() => {});
+      if (p) await backend.heartbeat(dataRoomId, p).catch(() => {});
     }, 30_000);
     return () => {
       unsub();
       if (hbRef.current) clearInterval(hbRef.current);
     };
-  }, [phase, roomId, myPeer, refreshParticipants]);
+  }, [phase, dataRoomId, myPeer, refreshParticipants]);
 
   // таймер разговора
   useEffect(() => {
@@ -192,29 +202,31 @@ export default function RoomPage() {
   }, [localStream]);
 
   async function join() {
+    if (joiningRef.current) return;
     setError('');
     setMediaError('');
     const name = guestName.trim() || 'Гость';
     const v = validate(guestNameSchema, name);
     if (!v.ok) return setError(v.errors.form ?? 'Проверьте имя');
 
+    joiningRef.current = true;
     setPhase('connecting');
     try {
       // проверка прав и вступление
       const me = await backend.getSessionUserId();
-      const res = await backend.joinRoom(roomId, { userId: me, displayName: me ? undefined! : name || 'Гость' }).catch(() => null);
-      // joinRoom требует displayName — корректируем вызов ниже
-      void res;
-      const joinRes = await backend.joinRoom(roomId, { userId: me, displayName: name });
+      const profile = me ? await backend.getProfile(me) : null;
+      const joinRes = await backend.joinRoom(dataRoomId, { userId: me, displayName: profile?.display_name.slice(0, 40) || name });
       if (!joinRes.participant) {
         setPhase('prejoin');
         return setError(joinRes.error ?? 'Не удалось подключиться к комнате');
       }
       const participantId = joinRes.participant.id;
       setMyPeer(participantId);
+      participantRef.current = participantId;
+      activeRoomRef.current = dataRoomId;
 
       // медиа
-      const mgr = new CallManager(transportFor(roomId), roomId, participantId, {
+      const mgr = new CallManager(transportFor(dataRoomId), dataRoomId, participantId, {
         onLocalStream: (s) => setLocalStream(s),
         onRemoteStream: (peerId, s) => {
           if (s) remoteStreams.current.set(peerId, s);
@@ -224,25 +236,26 @@ export default function RoomPage() {
         onPeerState: (_p, st) => setNetState(st),
       });
       managerRef.current = mgr;
-      mgr.start();
       await mgr.initMedia(videoOn);
+      if (!mountedRef.current) { await hardCleanup(); return; }
+      setCamOn(videoOn);
+      mgr.start();
 
       // существующие участники
-      const others = await backend.listParticipants(roomId);
+      const others = await backend.listParticipants(dataRoomId);
       for (const p of others) if (p.id !== participantId) void mgr.handlePeerJoined(p.id);
       setParticipants(others);
 
       // при появлении новых участников — создаём соединения
-      const unsub = backend.subscribeRoom(roomId, () => {
-        void backend.listParticipants(roomId).then((list) => {
+      const unsub = backend.subscribeRoom(dataRoomId, () => {
+        void backend.listParticipants(dataRoomId).then((list) => {
           setParticipants(list);
-          for (const p of list) if (p.id !== participantId) void mgr.handlePeerJoined(p.id);
           for (const id of [...remoteStreams.current.keys()]) if (!list.some((p) => p.id === id)) mgr.handlePeerLeft(id);
         });
       });
 
       setPhase('in-call');
-      cleanupFns.push(unsub);
+      cleanupFns.current.push(unsub);
 
       if (isDirect) {
         const metaRaw = sessionStorage.getItem('nexus-active-call');
@@ -258,10 +271,12 @@ export default function RoomPage() {
       else if (err.name === 'NotFoundError') setMediaError('Устройство записи не найдено. Подключите микрофон/камеру.');
       else setError(err.message || 'Не удалось подключиться');
       await hardCleanup();
+    } finally {
+      joiningRef.current = false;
     }
   }
 
-  const cleanupFns: Array<() => void> = [];
+
 
   async function leaveCall(reason?: string) {
     setPhase('ended');
@@ -277,18 +292,19 @@ export default function RoomPage() {
       sessionStorage.removeItem('nexus-active-call');
     }
     // если мы последний живой участник — закрываем комнату
-    const remaining = await backend.listParticipants(roomId);
-    if (!remaining.length) await backend.endRoom(roomId).catch(() => {});
+    const remaining = await backend.listParticipants(dataRoomId);
+    if (!remaining.length) await backend.endRoom(dataRoomId).catch(() => {});
   }
 
   async function hardCleanup() {
-    for (const f of cleanupFns.splice(0)) f();
+    for (const f of cleanupFns.current.splice(0)) f();
     const mgr = managerRef.current;
     if (mgr) {
-      const pid = myPeer;
+      const pid = participantRef.current;
       await mgr.destroy();
-      if (pid) await backend.leaveRoom(roomId, pid).catch(() => {});
+      if (pid) await backend.leaveRoom(dataRoomId, pid).catch(() => {});
       managerRef.current = null;
+      participantRef.current = '';
     }
     remoteStreams.current.clear();
     setLocalStream(null);
@@ -296,9 +312,12 @@ export default function RoomPage() {
 
   // уход с страницы = завершение звонка
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
-      for (const f of cleanupFns.splice(0)) f();
+      mountedRef.current = false;
+      for (const f of cleanupFns.current.splice(0)) f();
       void managerRef.current?.destroy();
+      if (participantRef.current) void backend.leaveRoom(activeRoomRef.current, participantRef.current).catch(() => {});
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -313,6 +332,8 @@ export default function RoomPage() {
   }
 
   /* ===== prejoin / joining ===== */
+  if (phase === 'ended') return <InvalidScreen message={error || 'Звонок завершён'} onBack={() => navigate('/')} />;
+
   if (!inCall) {
     return (
       <div className="flex min-h-dvh flex-col items-center justify-center bg-gradient-to-b from-slate-900 to-slate-950 p-4 text-white pt-safe pb-safe">
@@ -356,7 +377,7 @@ export default function RoomPage() {
                   {videoOn ? <VideoIcon className="h-4 w-4" /> : <VideoOff className="h-4 w-4" />} {videoOn ? 'Камера включена' : 'Камера выключена'}
                 </button>
               </div>
-              {!isSupabaseConfigured && !localStorage.getItem('nexus-demo-session') && (
+              {!isSupabaseConfigured && !sessionStorage.getItem('nexus-demo-session') && (
                 <button className="btn-secondary w-full !border-slate-700 !bg-slate-800 !text-slate-200" onClick={() => navigate('/auth')}>
                   <LogIn className="h-4 w-4" /> Войти в аккаунт (не обязательно)
                 </button>
@@ -391,7 +412,6 @@ export default function RoomPage() {
       setErrorOnly('Не удалось переключить камеру');
     }
   }
-  const [tinyNotice, setTinyNotice] = useState('');
   function setErrorOnly(m: string) {
     setTinyNotice(m);
     setTimeout(() => setTinyNotice(''), 2500);
@@ -426,7 +446,7 @@ export default function RoomPage() {
             {/* локальное PiP */}
             <div className="absolute bottom-24 right-3 z-10 h-28 w-20 overflow-hidden rounded-xl border border-white/20 bg-slate-900 shadow-lg sm:h-36 sm:w-28">
               {localStream && localStream.getVideoTracks().some((t) => t.enabled) ? (
-                <video autoPlay playsInline muted srcObject={localStream} className="h-full w-full -scale-x-100 object-cover" />
+                <video autoPlay playsInline muted ref={el => { if (el) el.srcObject = localStream; }} className="h-full w-full -scale-x-100 object-cover" />
               ) : (
                 <div className="flex h-full flex-col items-center justify-center gap-1 text-[10px] text-slate-400"><VideoOff className="h-5 w-5" /> камера выкл</div>
               )}
@@ -434,6 +454,7 @@ export default function RoomPage() {
           </div>
         ) : (
           <div className="flex h-full flex-col items-center justify-center gap-4 p-6">
+            {remoteList.map(([pid, stream]) => <audio key={pid} autoPlay ref={el => { if (el) el.srcObject = stream; }} />)}
             <div className="flex -space-x-3">
               {participants.slice(0, 5).map((p) => <Avatar key={p.id} name={p.display_name} src={p.user?.avatar_url} size={56} className="ring-2 ring-slate-950" />)}
             </div>
@@ -544,15 +565,3 @@ function InvalidScreen({ message, onBack }: { message: string; onBack(): void })
     </div>
   );
 }
-
-// srcObject для video — нет встроенного атрибута React, используем ref-обёртку
-declare module 'react' {
-  interface ImgHTMLAttributes<T> {
-    srcObject?: MediaStream | null;
-  }
-  interface VideoHTMLAttributes<T> {
-    srcObject?: MediaStream | null;
-  }
-}
-
-void Share2;

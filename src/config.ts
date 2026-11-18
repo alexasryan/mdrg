@@ -51,5 +51,5 @@ export const BASE_PATH = import.meta.env.BASE_URL;
 /** Построить абсолютную ссылку-приглашение для комнаты */
 export function buildInviteLink(roomId: string): string {
   const base = window.location.origin + BASE_PATH.replace(/\/$/, '');
-  return `${base}/call/${roomId}`;
+  return `${base}/#/call/${roomId}`;
 }

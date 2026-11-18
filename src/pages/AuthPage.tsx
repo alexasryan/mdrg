@@ -4,6 +4,7 @@ import { MessageCircle, Loader2 } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
 import { loginSchema, registerSchema, resetSchema, validate } from '../lib/validation';
 import { APP_CONFIG } from '../config';
+import { backend } from '../lib/backend';
 
 type Mode = 'login' | 'register' | 'reset';
 
@@ -30,7 +31,6 @@ export default function AuthPage() {
         const v = validate(resetSchema, { email: form.email });
         if (!v.ok) return setErrors(v.errors);
         // восстановление пароля — через Supabase (в демо недоступно)
-        const { backend } = await import('../lib/backend');
         const res = await backend.resetPassword(form.email);
         if (res.error) setFormError(res.error);
         else setInfo('Если такой e-mail зарегистрирован, мы отправили ссылку для сброса пароля.');
@@ -54,6 +54,8 @@ export default function AuthPage() {
       } else {
         navigate('/');
       }
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : 'Не удалось выполнить запрос. Попробуйте ещё раз.');
     } finally {
       setBusy(false);
     }
@@ -128,7 +130,7 @@ export default function AuthPage() {
             </Link>
           </div>
         </form>
-        <p className="mt-4 text-center text-xs text-slate-400">Пароли хранятся только в Supabase Auth. Мы не храним пароли в базе данных.</p>
+        <p className="mt-4 text-center text-xs text-slate-400">{demoMode ? 'Демо работает только в этом браузере. Используйте тестовые данные и отдельный пароль; данные и хеши демо-паролей хранятся локально.' : 'Авторизация выполняется через Supabase Auth.'}</p>
       </div>
     </div>
   );

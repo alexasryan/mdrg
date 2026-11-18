@@ -107,7 +107,7 @@ class SupabaseBackend implements BackendApi {
     const { data, error } = await sb().auth.signUp({
       email,
       password,
-      options: { data: { display_name: displayName, username }, emailRedirectTo: window.location.origin },
+      options: { data: { display_name: displayName, username }, emailRedirectTo: new URL(import.meta.env.BASE_URL, window.location.origin).href },
     });
     if (error) return { error: translateAuthError(error.message), needsConfirmation: false };
     const needsConfirmation = !!data.user && !data.session;
@@ -302,9 +302,10 @@ class SupabaseBackend implements BackendApi {
         .single();
       return c as Call;
     }
+    const room = await this.createRoom(callerId, 'Личный звонок', mode);
     const { data, error } = await sb()
       .from('calls')
-      .insert({ caller_id: callerId, callee_id: calleeId, chat_id: chatId, mode })
+      .insert({ caller_id: callerId, callee_id: calleeId, chat_id: chatId, room_id: room.id, mode })
       .select('*')
       .single();
     if (error) throw new Error(error.message);
@@ -448,8 +449,8 @@ function translateStorageError(msg: string): string {
 
 /* ============================ MOCK ============================ */
 
-const mock = new MockBackend(bc);
+
 
 /* ============================ EXPORT ============================ */
 
-export const backend: BackendApi = isSupabaseConfigured ? new SupabaseBackend() : mock;
+export const backend: BackendApi = isSupabaseConfigured ? new SupabaseBackend() : new MockBackend(bc);

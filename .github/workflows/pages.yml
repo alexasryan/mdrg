@@ -1,0 +1,60 @@
+name: Build, test and publish Messenger
+on:
+  push:
+    branches: [nexus-messenger-web-app-164dd]
+  pull_request:
+    branches: [nexus-messenger-web-app-164dd]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npx playwright install --with-deps chromium
+      - name: Test the production build in a browser
+        run: npm run test:browser
+      - name: Select GitHub Actions as the Pages publishing source
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method PUT "repos/$GITHUB_REPOSITORY/pages" -f build_type=workflow
+      - uses: actions/configure-pages@v5
+        if: github.event_name != 'pull_request'
+      - uses: actions/upload-pages-artifact@v4
+        if: github.event_name != 'pull_request'
+        with:
+          path: dist
+      - uses: actions/deploy-pages@v4
+        id: deployment
+        if: github.event_name != 'pull_request'
+      - name: Verify published HTML and assets
+        if: github.event_name != 'pull_request'
+        run: node scripts/verify-deployment.mjs
+      - name: Test the published application
+        if: github.event_name != 'pull_request'
+        env:
+          PLAYWRIGHT_BASE_URL: https://alexasryan.github.io/mdrg/
+        run: npm run test:browser
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-report
+          path: test-results/
