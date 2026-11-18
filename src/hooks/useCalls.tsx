@@ -11,17 +11,23 @@ export interface ActiveIncoming {
 
 interface CallsCtxValue {
   incoming: ActiveIncoming | null;
+  error: string;
+  busy: boolean;
   acceptIncoming(): void;
   declineIncoming(): void;
 }
 
-const Ctx = createContext<CallsCtxValue>({ incoming: null, acceptIncoming: () => {}, declineIncoming: () => {} });
+const Ctx = createContext<CallsCtxValue>({ incoming: null, error: '', busy: false, acceptIncoming: () => {}, declineIncoming: () => {} });
 
 export function CallProvider({ userId, children }: { userId: string | null; children: ReactNode }) {
   const [incoming, setIncoming] = useState<ActiveIncoming | null>(null);
   const navigate = useNavigate();
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
+    setIncoming(null);
+    setError('');
     if (!userId) return;
     const unsub = backend.subscribeIncomingCall(userId, (e) => {
       setIncoming((cur) => cur ?? { callId: e.call_id, mode: e.mode, caller: e.caller ?? null });
@@ -36,21 +42,24 @@ export function CallProvider({ userId, children }: { userId: string | null; chil
     };
   }, [userId]);
 
-  const acceptIncoming = useCallback(() => {
+  const acceptIncoming = useCallback(async () => {
     if (!incoming) return;
-    void backend.acceptCall(incoming.callId);
+    setBusy(true); setError('');
+    try {
+    const result = await backend.acceptCall(incoming.callId);
+    if (result.error) { setError(result.error); return; }
     sessionStorage.setItem('nexus-active-call', JSON.stringify({ callId: incoming.callId, role: 'callee', mode: incoming.mode, peer: incoming.caller }));
     setIncoming(null);
     navigate('/room/call-' + incoming.callId);
+    } catch { setError('Не удалось принять звонок. Проверьте соединение'); } finally { setBusy(false); }
   }, [incoming, navigate]);
 
-  const declineIncoming = useCallback(() => {
+  const declineIncoming = useCallback(async () => {
     if (!incoming) return;
-    void backend.declineCall(incoming.callId);
-    setIncoming(null);
+    try { await backend.declineCall(incoming.callId); setIncoming(null); } catch { setError('Не удалось отклонить звонок. Проверьте соединение'); }
   }, [incoming]);
 
-  return <Ctx.Provider value={{ incoming, acceptIncoming, declineIncoming }}>{children}</Ctx.Provider>;
+  return <Ctx.Provider value={{ incoming, error, busy, acceptIncoming, declineIncoming }}>{children}</Ctx.Provider>;
 }
 
 export const useCalls = () => useContext(Ctx);

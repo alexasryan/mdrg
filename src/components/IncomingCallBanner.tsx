@@ -3,7 +3,7 @@ import { useCalls } from '../hooks/useCalls';
 import { Avatar } from './ui';
 
 export function IncomingCallBanner() {
-  const { incoming, acceptIncoming, declineIncoming } = useCalls();
+  const { incoming, error, busy, acceptIncoming, declineIncoming } = useCalls();
   if (!incoming) return null;
   return (
     <div className="fixed inset-x-3 top-3 z-[70] mx-auto max-w-md animate-slide-up sm:left-auto sm:right-4" role="alertdialog" aria-label="Входящий звонок">
@@ -18,13 +18,14 @@ export function IncomingCallBanner() {
           <p className="truncate text-sm font-semibold">{incoming.caller?.display_name ?? 'Неизвестный'}</p>
           <p className="text-xs text-slate-500 animate-pulse">Входящий {incoming.mode === 'video' ? 'видеозвонок' : 'аудиозвонок'}…</p>
         </div>
-        <button className="flex h-11 w-11 items-center justify-center rounded-full bg-red-500 text-white shadow hover:bg-red-600 active:scale-95" onClick={declineIncoming} aria-label="Отклонить звонок">
+        <button className="flex h-11 w-11 items-center justify-center rounded-full bg-red-500 text-white shadow hover:bg-red-600 active:scale-95" disabled={busy} onClick={declineIncoming} aria-label="Отклонить звонок">
           <PhoneOff className="h-5 w-5" />
         </button>
-        <button className="flex h-11 w-11 items-center justify-center rounded-full bg-emerald-500 text-white shadow hover:bg-emerald-600 active:scale-95 animate-[pulseSoft_1.4s_ease-in-out_infinite]" onClick={acceptIncoming} aria-label="Принять звонок">
+        <button className="flex h-11 w-11 items-center justify-center rounded-full bg-emerald-500 text-white shadow hover:bg-emerald-600 active:scale-95 animate-[pulseSoft_1.4s_ease-in-out_infinite]" disabled={busy} onClick={acceptIncoming} aria-label="Принять звонок">
           <Phone className="h-5 w-5" />
         </button>
       </div>
+      {error && <p role="alert" className="rounded-lg bg-red-100 p-2 text-sm text-red-700">{error}</p>}
     </div>
   );
 }

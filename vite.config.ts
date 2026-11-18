@@ -8,5 +8,5 @@ export default defineConfig(({ command, isPreview }) => ({
   base: process.env.VITE_BASE || (command === 'serve' && !isPreview ? '/' : '/mdrg/'),
   server: { host: '0.0.0.0', port: 5173 },
   build: { outDir: '../dist', emptyOutDir: true },
-  test: { root: '.', environment: 'node', include: ['src/**/*.test.ts'] },
+  test: { root: '.', environment: 'node', include: ['src/**/*.test.ts', 'tests/**/*.test.ts'] },
 }));

@@ -37,8 +37,8 @@ export default function HomePage() {
   }, [userId]);
 
   useEffect(() => {
-    void loadChats();
-    const unsub = backend.subscribeChats(userId, () => void loadChats());
+    void loadChats().catch(() => { setChats([]); showToast('Не удалось загрузить чаты. Проверьте соединение'); });
+    const unsub = backend.subscribeChats(userId, () => { void loadChats().catch(() => {}); });
     const t = setInterval(() => setOnlineTick((x) => x + 1), 30_000);
     return () => {
       unsub();
@@ -61,11 +61,11 @@ export default function HomePage() {
     if (tab === 'people') {
       const id = setTimeout(async () => {
         setPeople(null);
-        setPeople(await backend.searchUsers(searchQ, userId));
+        try { setPeople(await backend.searchUsers(searchQ, userId)); } catch { setPeople([]); showToast('Поиск недоступен. Проверьте соединение'); }
       }, searchQ ? 300 : 0);
       return () => clearTimeout(id);
     }
-    if (tab === 'calls') void backend.listCalls(userId).then(setCalls);
+    if (tab === 'calls') void backend.listCalls(userId).then(setCalls).catch(() => { setCalls([]); showToast('Не удалось загрузить звонки'); });
   }, [tab, searchQ, userId]);
 
   const showToast = (msg: string) => {
@@ -234,7 +234,7 @@ function PeopleInlineSearch({ meId, onStart }: { meId: string; onStart(p: Profil
   const [q, setQ] = useState('');
   const [res, setRes] = useState<Profile[] | null>(null);
   useEffect(() => {
-    const id = setTimeout(async () => setRes(await backend.searchUsers(q, meId)), q ? 300 : 0);
+    const id = setTimeout(async () => setRes(await backend.searchUsers(q, meId).catch(() => [])), q ? 300 : 0);
     return () => clearTimeout(id);
   }, [q, meId]);
   return (
@@ -293,6 +293,7 @@ function ChatView({ chatId, me, onBack, onToast }: { chatId: string; me: string;
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const pendingMessage = useRef<{ fingerprint: string; id: string } | null>(null);
 
   const reloadChat = async () => {
     const chats = await backend.getChats(me);
@@ -306,16 +307,16 @@ function ChatView({ chatId, me, onBack, onToast }: { chatId: string; me: string;
       await reloadChat();
       const msgs = await backend.getMessages(chatId);
       if (!mounted) return;
-      setMessages(msgs);
+      setMessages(msgs.filter(m => !m.deleted_at));
       setHasMore(msgs.length >= APP_CONFIG.limits.pageSize);
       setLoading(false);
-      void backend.markRead(chatId, me);
-    })();
+      void backend.markRead(chatId, me).catch(() => {});
+    })().catch(() => { if (mounted) { setLoading(false); onToast('Не удалось загрузить сообщения. Проверьте соединение'); } });
     const unsubMsg = backend.subscribeChat(chatId, (m) => {
       if (!mounted) return;
-      setMessages((prev) => (prev.some((x) => x.id === m.id) ? prev : [...prev, m]));
+      setMessages(prev => m.deleted_at ? prev.filter(x => x.id !== m.id) : prev.some(x => x.id === m.id) ? prev.map(x => x.id === m.id ? m : x) : [...prev, m].sort((a,b) => a.created_at.localeCompare(b.created_at)));
       if (m.sender_id !== me) {
-        void backend.markRead(chatId, me);
+        void backend.markRead(chatId, me).catch(() => {});
         if (document.visibilityState !== 'visible' && settings.notificationsEnabled) {
           showNotification(m.sender?.display_name ?? 'Новое сообщение', m.content || 'Вложение');
         }
@@ -350,11 +351,15 @@ function ChatView({ chatId, me, onBack, onToast }: { chatId: string; me: string;
     const replying = replyTo;
     setReplyTo(null);
     try {
-      const m = await backend.sendMessage(chatId, me, content, replying?.id ?? null, null);
+      const fingerprint = JSON.stringify([chatId, content, replying?.id]);
+      if (pendingMessage.current?.fingerprint !== fingerprint) pendingMessage.current = { fingerprint, id: crypto.randomUUID() };
+      const m = await backend.sendMessage(chatId, me, content, replying?.id ?? null, null, pendingMessage.current!.id);
+      pendingMessage.current = null;
       setMessages((p) => p.some(x => x.id === m.id) ? p : [...p, m]);
     } catch (e) {
       onToast('Ошибка отправки: ' + (e as Error).message);
       setText(content);
+      setReplyTo(replying);
     } finally {
       setSending(false);
       void reloadChat();
@@ -442,7 +447,7 @@ function ChatView({ chatId, me, onBack, onToast }: { chatId: string; me: string;
         ) : (
           <div className="mx-auto max-w-2xl space-y-1.5">
             {hasMore && messages.length > 0 && (
-              <button className="mx-auto block rounded-lg px-3 py-1.5 text-xs text-primary-600 hover:bg-primary-50 dark:hover:bg-slate-800" onClick={() => void loadOlder()}>Загрузить историю ранее</button>
+              <button className="mx-auto block rounded-lg px-3 py-1.5 text-xs text-primary-600 hover:bg-primary-50 dark:hover:bg-slate-800" onClick={() => { void loadOlder().catch(() => onToast('Не удалось загрузить историю')); }}>Загрузить историю ранее</button>
             )}
             {!visible.length && <EmptyState icon={<Users className="h-8 w-8" />} title={historyQuery ? 'Ничего не найдено' : 'Сообщений пока нет'} hint={historyQuery ? undefined : 'Напишите первое сообщение 👋'} />}
             {visible.map((m, idx) => {

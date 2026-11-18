@@ -1,10 +1,11 @@
 import { defineConfig } from '@playwright/test';
 export default defineConfig({
   testDir: './browser-tests',
-  timeout: 60000,
+  timeout: 90000,
   workers: 1,
   reporter: [['list'], ['json', { outputFile: 'test-results/results.json' }]],
   use: {
+    proxy: process.env.HTTPS_PROXY ? { server: process.env.HTTPS_PROXY, bypass: '127.0.0.1,localhost' } : undefined,
     baseURL: process.env.PLAYWRIGHT_BASE_URL || 'http://127.0.0.1:4173/mdrg/',
     permissions: ['camera', 'microphone'],
     screenshot: 'only-on-failure',

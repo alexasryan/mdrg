@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useLocation } from 'react-router-dom';
 import { MessageCircle, Loader2 } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
 import { loginSchema, registerSchema, resetSchema, validate } from '../lib/validation';
@@ -11,6 +11,9 @@ type Mode = 'login' | 'register' | 'reset';
 export default function AuthPage() {
   const { signIn, signUp, demoMode } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
+  const from = location.state?.from;
+  const destination = typeof from === 'string' && from.startsWith('/') && !from.startsWith('//') ? from : '/';
   const [mode, setMode] = useState<Mode>('login');
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState('');
@@ -41,7 +44,7 @@ export default function AuthPage() {
         if (!v.ok) return setErrors(v.errors);
         const res = await signIn(v.value.email, v.value.password);
         if (res.error) return setFormError(res.error);
-        navigate('/');
+        navigate(destination);
         return;
       }
       const v = validate(registerSchema, form);
@@ -52,7 +55,7 @@ export default function AuthPage() {
         setInfo('Аккаунт создан! Подтвердите e-mail по ссылке из письма, затем войдите.');
         setMode('login');
       } else {
-        navigate('/');
+        navigate(destination);
       }
     } catch (error) {
       setFormError(error instanceof Error ? error.message : 'Не удалось выполнить запрос. Попробуйте ещё раз.');

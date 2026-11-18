@@ -46,6 +46,7 @@ export interface Message {
   attachment: Attachment | null;
   type: MessageType;
   read_by: string[];
+  deleted_at?: string | null;
   created_at: string;
   sender?: Pick<Profile, 'id' | 'display_name' | 'avatar_url'> | null;
   reply_to_message?: Pick<Message, 'id' | 'content' | 'sender_id'> | null;

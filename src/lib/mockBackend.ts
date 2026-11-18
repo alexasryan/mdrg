@@ -156,6 +156,7 @@ export class MockBackend implements BackendApi {
     this.setSession(null);
     this.notify('auth');
   }
+  async updatePassword(_password: string) { return { error: 'В демо-режиме смена пароля недоступна' }; }
   async resetPassword(_email: string) {
     return { error: 'В демо-режиме восстановление пароля недоступно. Настройте Supabase Auth.' };
   }

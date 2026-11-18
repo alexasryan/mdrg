@@ -6,16 +6,18 @@ import { APP_CONFIG } from '../config';
  * demo-режиме (см. lib/mockBackend.ts), чтобы интерфейс можно было
  * оценить без внешней инфраструктуры.
  */
-export const isSupabaseConfigured = Boolean(APP_CONFIG.supabaseUrl && APP_CONFIG.supabaseAnonKey);
+export const isSupabaseConfigured = Boolean(!APP_CONFIG.demoMode && APP_CONFIG.supabaseUrl && APP_CONFIG.supabaseAnonKey);
 
 let client: SupabaseClient | null = null;
 
-if (isSupabaseConfigured) {
+if (isSupabaseConfigured && !APP_CONFIG.demoMode) {
   client = createClient(APP_CONFIG.supabaseUrl!, APP_CONFIG.supabaseAnonKey!, {
     auth: {
       persistSession: true,
       autoRefreshToken: true,
       detectSessionInUrl: true,
+      flowType: 'pkce',
+      storageKey: 'mdrg-auth',
     },
   });
 }

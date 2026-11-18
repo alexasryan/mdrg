@@ -11,6 +11,7 @@ import HomePage from './pages/HomePage';
 import SettingsPage from './pages/SettingsPage';
 import CreateCallPage from './pages/CreateCallPage';
 import RoomPage from './pages/RoomPage';
+import UpdatePasswordPage from './pages/UpdatePasswordPage';
 import NotFoundPage from './pages/NotFoundPage';
 
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
@@ -43,18 +44,22 @@ function FullscreenLoader() {
 
 function Protected({ children }: { children: ReactNode }) {
   const { user, loading } = useAuth();
+  const location = useLocation();
   if (loading) return <FullscreenLoader />;
-  if (!user) return <Navigate to="/auth" replace />;
+  if (!user) return <Navigate to="/auth" replace state={{ from: location.pathname }} />;
   return <>{children}</>;
 }
 
 function Shell() {
-  const { user, loading } = useAuth();
+  const { user, loading, recovery } = useAuth();
   const location = useLocation();
   useEffect(() => {
     document.title = `${APP_CONFIG.name}${location.pathname === '/' ? '' : ' · ' + location.pathname.split('/').filter(Boolean).join('/')}`;
   }, [location]);
   if (loading) return <FullscreenLoader />;
+  if (recovery && user) return <UpdatePasswordPage />;
+  const from = location.state?.from;
+  const destination = typeof from === 'string' && from.startsWith('/') && !from.startsWith('//') ? from : '/';
   return (
     <>
       <CallProvider userId={user?.id ?? null}>
@@ -64,10 +69,10 @@ function Shell() {
         <Route path="/chat/:chatId" element={<Protected><HomePage /></Protected>} />
         <Route path="/settings" element={<Protected><SettingsPage /></Protected>} />
         <Route path="/create-call" element={<Protected><CreateCallPage /></Protected>} />
-        <Route path="/auth" element={user ? <Navigate to="/" replace /> : <AuthPage />} />
-        {/* комнаты и прямые звонки доступны гостям без авторизации */}
-        <Route path="/room/:id" element={<RoomPage key={location.pathname} />} />
-        <Route path="/call/:id" element={<RoomPage key={location.pathname} />} />
+        <Route path="/auth" element={user ? <Navigate to={destination} replace /> : <AuthPage />} />
+        {/* В серверном режиме комнаты требуют авторизации */}
+        <Route path="/room/:id" element={APP_CONFIG.demoMode ? <RoomPage key={location.pathname} /> : <Protected><RoomPage key={location.pathname} /></Protected>} />
+        <Route path="/call/:id" element={APP_CONFIG.demoMode ? <RoomPage key={location.pathname} /> : <Protected><RoomPage key={location.pathname} /></Protected>} />
         <Route path="*" element={<NotFoundPage />} />
       </Routes>
       </CallProvider>

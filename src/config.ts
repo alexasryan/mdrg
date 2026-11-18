@@ -1,3 +1,4 @@
+import publicConfig from '../supabase.public.json';
 /**
  * Глобальная конфигурация Nexus Messenger.
  * Все значения легко изменить в одном месте или через переменные окружения.
@@ -9,8 +10,9 @@ export const APP_CONFIG = {
   /** Краткое описание */
   tagline: 'Быстрые сообщения и звонки прямо в браузере',
 
-  supabaseUrl: import.meta.env.VITE_SUPABASE_URL as string | undefined,
-  supabaseAnonKey: import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined,
+  demoMode: import.meta.env.VITE_DEMO === 'true',
+  supabaseUrl: import.meta.env.VITE_SUPABASE_URL || publicConfig.url,
+  supabaseAnonKey: import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY || import.meta.env.VITE_SUPABASE_ANON_KEY || publicConfig.publishableKey,
 
   /** Максимум участников комнаты звонка по ссылке (P2P mesh без SFU) */
   maxRoomParticipants: Number(import.meta.env.VITE_MAX_ROOM_PARTICIPANTS || 4),

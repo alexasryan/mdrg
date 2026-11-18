@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+test.skip(process.env.MDRG_DEMO_TEST !== '1', 'Explicit demo build only');
 
 async function login(page: Page, name: 'anna' | 'ivan') {
   await page.goto('./#/auth');

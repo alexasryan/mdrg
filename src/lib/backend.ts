@@ -1,25 +1,8 @@
-/**
- * Единый API данных для Nexus Messenger.
- * Реализация выбирается автоматически:
- *  - Supabase (реальный бэкенд, realtime, storage) если настроен;
- *  - MockBackend (localStorage + BroadcastChannel) — демо-режим без сервера,
- *    чтобы приложение можно было открыть и протестировать в двух вкладках.
- */
+import type { SupabaseClient, RealtimeChannel } from '@supabase/supabase-js';
 import { supabase, isSupabaseConfigured } from './supabase';
 import { MockBackend } from './mockBackend';
-import type {
-  Profile,
-  Chat,
-  Message,
-  Call,
-  CallRoom,
-  RoomParticipant,
-  SignalMessage,
-  IncomingCallEvent,
-  CallMode,
-  Attachment,
-} from '../types';
-
+import { APP_CONFIG } from '../config';
+import type { Profile, Chat, Message, Call, CallRoom, RoomParticipant, SignalMessage, IncomingCallEvent, CallMode, Attachment } from '../types';
 export interface BackendApi {
   // auth
   getSessionUserId(): Promise<string | null>;
@@ -27,8 +10,9 @@ export interface BackendApi {
   signUp(email: string, password: string, displayName: string, username: string): Promise<{ error?: string; needsConfirmation: boolean }>;
   signIn(email: string, password: string): Promise<{ error?: string }>;
   signOut(): Promise<void>;
+  updatePassword(password: string): Promise<{ error?: string }>;
   resetPassword(email: string): Promise<{ error?: string }>;
-  onAuthChange(cb: (userId: string | null) => void): () => void;
+  onAuthChange(cb: (userId: string | null, event?: string) => void): () => void;
 
   // profiles
   searchUsers(q: string, excludeId?: string): Promise<Profile[]>;
@@ -40,7 +24,7 @@ export interface BackendApi {
   getChats(userId: string): Promise<Chat[]>;
   createDirectChat(me: string, peerId: string): Promise<Chat>;
   getMessages(chatId: string, before?: string): Promise<Message[]>;
-  sendMessage(chatId: string, senderId: string, content: string, replyTo: string | null, attachment: Attachment | null): Promise<Message>;
+  sendMessage(chatId: string, senderId: string, content: string, replyTo: string | null, attachment: Attachment | null, messageId?: string): Promise<Message>;
   deleteMessage(messageId: string, userId: string): Promise<{ error?: string }>;
   markRead(chatId: string, userId: string): Promise<void>;
   subscribeChat(chatId: string, cb: (m: Message) => void): () => void;
@@ -75,382 +59,163 @@ export interface BackendApi {
   subscribeSignals(roomId: string, selfPeer: string, cb: (s: SignalMessage) => void): () => void;
 }
 
-const CHANNEL = 'nexus-realtime';
 
-function bc(): BroadcastChannel | null {
-  try {
-    return new BroadcastChannel(CHANNEL);
-  } catch {
-    return null;
+const msgSelect = '*,sender:profiles!messages_sender_id_fkey(id,display_name,avatar_url)';
+const callbackUrl = () => new URL(import.meta.env.BASE_URL, window.location.origin).href;
+function fail(error: { message: string } | null) { if (error) throw new Error(error.message); }
+
+export class SupabaseBackend implements BackendApi {
+  private signed = new Map<string, { url: string; until: number }>();
+  constructor(private client: SupabaseClient) {}
+  private async rpc<T>(name: string, args: Record<string, unknown> = {}): Promise<T> {
+    const { data, error } = await this.client.rpc(name, args); fail(error); return data as T;
   }
-}
-
-/* ============================ SUPABASE ============================ */
-
-const sb = () => {
-  if (!supabase) throw new Error('Supabase не настроен');
-  return supabase;
-};
-
-const msgSelect = `*, sender:profiles!messages_sender_id_fkey(id, display_name, avatar_url), reply_to_message:messages!messages_reply_to_fkey(id, content, sender_id)`;
-
-class SupabaseBackend implements BackendApi {
-  async getSessionUserId() {
-    const { data } = await sb().auth.getSession();
-    return data.session?.user.id ?? null;
+  private subscribe(channel: RealtimeChannel, refresh: () => void, interval = 15000) {
+    let active = true;
+    const run = () => { if (active && navigator.onLine) refresh(); };
+    channel.subscribe(status => { if (status === 'SUBSCRIBED') run(); });
+    const timer = window.setInterval(run, interval);
+    window.addEventListener('online', run);
+    window.addEventListener('focus', run);
+    return () => { active = false; clearInterval(timer); window.removeEventListener('online', run); window.removeEventListener('focus', run); void this.client.removeChannel(channel); };
   }
-  async getProfile(userId: string) {
-    const { data } = await sb().from('profiles').select('*').eq('id', userId).maybeSingle();
-    return data as Profile | null;
-  }
+  async getSessionUserId() { const { data, error } = await this.client.auth.getSession(); fail(error); if (data.session) await this.client.realtime.setAuth(data.session.access_token); return data.session?.user.id ?? null; }
+  async getProfile(id: string) { const { data, error } = await this.client.from('profiles').select('*').eq('id', id).maybeSingle(); fail(error); return data as Profile | null; }
+  async signIn(email: string, password: string) { const { error } = await this.client.auth.signInWithPassword({ email, password }); return { error: error ? authError(error.message) : undefined }; }
   async signUp(email: string, password: string, displayName: string, username: string) {
-    const { data, error } = await sb().auth.signUp({
-      email,
-      password,
-      options: { data: { display_name: displayName, username }, emailRedirectTo: new URL(import.meta.env.BASE_URL, window.location.origin).href },
-    });
-    if (error) return { error: translateAuthError(error.message), needsConfirmation: false };
-    const needsConfirmation = !!data.user && !data.session;
-    return { needsConfirmation, error: undefined };
+    const { data, error } = await this.client.auth.signUp({ email, password, options: { data: { display_name: displayName, username }, emailRedirectTo: callbackUrl() } });
+    return { error: error ? authError(error.message) : undefined, needsConfirmation: !error && !data.session };
   }
-  async signIn(email: string, password: string) {
-    const { error } = await sb().auth.signInWithPassword({ email, password });
-    if (error) return { error: translateAuthError(error.message) };
-    return {};
+  async signOut() { const { error } = await this.client.auth.signOut({ scope: 'local' }); fail(error); this.signed.clear(); }
+  async updatePassword(password: string) { const { error } = await this.client.auth.updateUser({ password }); return { error: error ? authError(error.message) : undefined }; }
+  async resetPassword(email: string) { const { error } = await this.client.auth.resetPasswordForEmail(email, { redirectTo: callbackUrl() + '?recovery=1' }); return { error: error ? authError(error.message) : undefined }; }
+  onAuthChange(cb: (id: string | null, event?: string) => void) {
+    let active = true;
+    const { data } = this.client.auth.onAuthStateChange((event, session) => { setTimeout(() => { if (active) { if (session) void this.client.realtime.setAuth(session.access_token); cb(session?.user.id ?? null, event); } }, 0); });
+    return () => { active = false; data.subscription.unsubscribe(); };
   }
-  async signOut() {
-    await sb().auth.signOut();
-  }
-  async resetPassword(email: string) {
-    const { error } = await sb().auth.resetPasswordForEmail(email, { redirectTo: window.location.origin });
-    if (error) return { error: translateAuthError(error.message) };
-    return {};
-  }
-  onAuthChange(cb: (u: string | null) => void) {
-    const { data } = sb().auth.onAuthStateChange((_e, session) => cb(session?.user.id ?? null));
-    return () => data.subscription.unsubscribe();
-  }
-
-  async searchUsers(q: string, excludeId?: string) {
-    const like = q.trim().replace(/[%_,()]/g, '');
-    let query = sb()
-      .from('profiles')
-      .select('*')
-      .or(`display_name.ilike.%${like}%,username.ilike.%${like}%`)
-      .limit(20);
-    if (excludeId) query = query.neq('id', excludeId);
-    const { data } = await query;
-    return (data ?? []) as Profile[];
+  async searchUsers(query: string, excludeId?: string) {
+    const like = query.trim().replace(/[^\p{L}\p{N} _-]/gu, '').slice(0, 60);
+    let q = this.client.from('profiles').select('*').limit(20).order('display_name');
+    if (like) q = q.or(`display_name.ilike.%${like}%,username.ilike.%${like}%`);
+    if (excludeId) q = q.neq('id', excludeId);
+    const { data, error } = await q; fail(error); return (data ?? []) as Profile[];
   }
   async updateProfile(userId: string, patch: Partial<Pick<Profile, 'display_name' | 'status_text'>>) {
-    const { error } = await sb().from('profiles').update(patch).eq('id', userId);
-    return { error: error?.message };
+    const { error } = await this.client.from('profiles').update(patch).eq('id', userId).select('id').single(); return { error: error?.message };
   }
   async uploadAvatar(userId: string, file: File) {
-    const ext = file.name.split('.').pop() || 'png';
-    const path = `${userId}/avatar.${ext}`;
-    const { error } = await sb().storage.from('avatars').upload(path, file, { upsert: true, contentType: file.type });
+    if (!['image/jpeg','image/png','image/webp'].includes(file.type) || file.size > 2*1024*1024) return { error: 'Используйте JPG, PNG или WebP до 2 МБ' };
+    const path = `${userId}/${crypto.randomUUID()}.${file.type.split('/')[1]}`;
+    const { error } = await this.client.storage.from('avatars').upload(path, file, { contentType: file.type });
     if (error) return { error: error.message };
-    const { data } = sb().storage.from('avatars').getPublicUrl(path);
-    await sb().from('profiles').update({ avatar_url: data.publicUrl }).eq('id', userId);
-    return { url: data.publicUrl };
+    const { data } = this.client.storage.from('avatars').getPublicUrl(path);
+    const { error: updateError } = await this.client.from('profiles').update({ avatar_url: data.publicUrl }).eq('id', userId).select('id').single();
+    return updateError ? { error: updateError.message } : { url: data.publicUrl };
   }
-  async setPresence(userId: string, online: boolean) {
-    await sb()
-      .from('profiles')
-      .update({ is_online: online, last_seen: new Date().toISOString() })
-      .eq('id', userId);
-    bc()?.postMessage({ t: 'presence', userId, online });
-  }
-
-  async getChats(userId: string) {
-    const { data } = await sb()
-      .from('chats')
-      .select('*, participants:chat_participants(user_id, profile:profiles!chat_participants_user_id_fkey(id, display_name, username, avatar_url, is_online))')
-      .eq('participants.user_id', userId)
-      .order('updated_at', { ascending: false })
-      .limit(100);
-    const chats = (data ?? []) as unknown as Chat[];
-    // последние сообщения
-    const ids = chats.map((c) => c.id);
-    if (ids.length) {
-      const { data: lastMsgs } = await sb()
-        .from('messages')
-        .select(msgSelect)
-        .in('chat_id', ids)
-        .order('created_at', { ascending: false })
-        .limit(ids.length * 3);
-      for (const c of chats) {
-        c.last_message = (lastMsgs ?? []).find((m) => m.chat_id === c.id) ?? null;
-      }
+  async setPresence(userId: string, online: boolean) { const { error } = await this.client.from('profiles').update({ is_online: online, last_seen: new Date().toISOString() }).eq('id', userId); fail(error); }
+  async getChats(_userId: string) { return this.rpc<Chat[]>('list_my_chats'); }
+  async createDirectChat(_me: string, peerId: string) { return this.rpc<Chat>('create_direct_chat', { p_peer: peerId }); }
+  private async hydrate(message: Message): Promise<Message> {
+    if (!message.attachment || message.deleted_at) return message;
+    const path = message.attachment.storage_path;
+    let signed = this.signed.get(path);
+    if (!signed || signed.until < Date.now()) {
+      const { data, error } = await this.client.storage.from('chat-files').createSignedUrl(path, 3600);
+      if (!error && data) { signed = { url: data.signedUrl, until: Date.now() + 50*60000 }; this.signed.set(path, signed); }
     }
-    return chats;
-  }
-  async createDirectChat(me: string, peerId: string) {
-    const { data: existing } = await sb()
-      .from('chat_participants')
-      .select('chat_id')
-      .eq('user_id', me);
-    for (const row of existing ?? []) {
-      const { data: other } = await sb().from('chat_participants').select('user_id').eq('chat_id', row.chat_id).neq('user_id', me).single();
-      if (other?.user_id === peerId) {
-        const { data: chat } = await sb().from('chats').select('*').eq('id', row.chat_id).single();
-        return chat as Chat;
-      }
-    }
-    const { data: chat, error } = await sb()
-      .from('chats')
-      .insert({ type: 'direct', created_by: me })
-      .select('*')
-      .single();
-    if (error) throw new Error(error.message);
-    await sb().from('chat_participants').insert([
-      { chat_id: chat.id, user_id: me },
-      { chat_id: chat.id, user_id: peerId },
-    ]);
-    bc()?.postMessage({ t: 'chats', userId: peerId });
-    return chat as Chat;
+    return { ...message, attachment: { ...message.attachment, url: signed?.url ?? '' } };
   }
   async getMessages(chatId: string, before?: string) {
-    let query = sb()
-      .from('messages')
-      .select(msgSelect)
-      .eq('chat_id', chatId)
-      .order('created_at', { ascending: false })
-      .limit(50);
-    if (before) query = query.lt('created_at', before);
-    const { data } = await query;
-    return ((data ?? []) as Message[]).reverse();
+    let q = this.client.from('messages').select(msgSelect).eq('chat_id', chatId).order('created_at', { ascending: false }).order('id', { ascending: false }).limit(50);
+    if (before) q = q.lt('created_at', before);
+    const { data, error } = await q; fail(error);
+    const messages = ((data ?? []) as unknown as Message[]).reverse();
+    const ids = [...new Set(messages.flatMap(m => m.reply_to ? [m.reply_to] : []))];
+    if (ids.length) {
+      const { data: replies, error: replyError } = await this.client.from('messages').select('id,content,sender_id,deleted_at').in('id', ids);
+      fail(replyError);
+      for (const m of messages) m.reply_to_message = replies?.find(r => r.id === m.reply_to && !r.deleted_at) ?? null;
+    }
+    return Promise.all(messages.map(m => this.hydrate(m)));
   }
-  async sendMessage(chatId: string, senderId: string, content: string, replyTo: string | null, attachment: Attachment | null) {
-    const { data, error } = await sb()
-      .from('messages')
-      .insert({ chat_id: chatId, sender_id: senderId, content, reply_to: replyTo, attachment })
-      .select(msgSelect)
-      .single();
-    if (error) throw new Error(error.message);
-    await sb().from('chats').update({ updated_at: new Date().toISOString() }).eq('id', chatId);
-    return data as Message;
+  async sendMessage(chatId: string, _senderId: string, content: string, replyTo: string | null, attachment: Attachment | null, messageId = crypto.randomUUID()) {
+    const m = await this.rpc<Message>('send_message', { p_id: messageId, p_chat: chatId, p_content: content, p_reply: replyTo, p_attachment: attachment });
+    return this.hydrate(m);
   }
-  async deleteMessage(messageId: string, userId: string) {
-    const { error } = await sb().from('messages').delete().eq('id', messageId).eq('sender_id', userId);
-    return { error: error?.message };
-  }
-  async markRead(chatId: string, userId: string) {
-    await sb().rpc('mark_chat_read', { p_chat: chatId, p_user: userId });
-  }
+  async deleteMessage(id: string, _userId: string) { const { error } = await this.client.rpc('delete_message', { p_message: id }); return { error: error?.message }; }
+  async markRead(chatId: string, userId: string) { await this.rpc('mark_chat_read', { p_chat: chatId, p_user: userId }); }
   subscribeChat(chatId: string, cb: (m: Message) => void) {
-    const ch = sb()
-      .channel(`chat:${chatId}`)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `chat_id=eq.${chatId}` }, async (p) => {
-        const m = p.new as Message;
-        // догружаем профиль отправителя
-        const { data } = await sb().from('profiles').select('id, display_name, avatar_url').eq('id', m.sender_id).single();
-        cb({ ...m, sender: data });
-      })
-      .subscribe();
-    return () => {
-      sb().removeChannel(ch);
-    };
+    let active = true;
+    let refreshing = false;
+    const seen = new Map<string, string>();
+    const deliver = async (m: Message) => { const hydrated = await this.hydrate(m); const key = JSON.stringify(hydrated); if (active && seen.get(m.id) !== key) { seen.set(m.id, key); cb(hydrated); } };
+    const refresh = () => { if (refreshing) return; refreshing = true; void this.getMessages(chatId).then(list => Promise.all(list.map(deliver))).catch(() => {}).finally(() => { refreshing = false; }); };
+    const ch = this.client.channel('chat:' + chatId + ':' + crypto.randomUUID()).on('postgres_changes', { event: '*', schema: 'public', table: 'messages', filter: 'chat_id=eq.' + chatId }, refresh);
+    const stop = this.subscribe(ch, refresh);
+    return () => { active = false; stop(); };
   }
-  subscribeChats(_userId: string, cb: () => void) {
-    const chan = bc();
-    const h = (ev: MessageEvent) => {
-      if (ev.data?.t === 'chats') cb();
-    };
-    chan?.addEventListener('message', h);
-    return () => chan?.removeEventListener('message', h);
+  subscribeChats(userId: string, cb: () => void) {
+    const ch = this.client.channel('chats:' + crypto.randomUUID())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'chats' }, cb)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'chat_participants', filter: 'user_id=eq.' + userId }, cb)
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'profiles' }, cb);
+    return this.subscribe(ch, cb);
   }
-
-  async uploadChatFile(_chatId: string, senderId: string, file: File, onProgress?: (p: number) => void) {
-    const path = `${senderId}/${Date.now()}_${file.name.replace(/[^\w.\-А-Яа-яёЁ ]+/g, '')}`;
-    try {
-      const { error } = await sb().storage.from('chat-files').upload(path, file, {
-        upsert: false,
-        contentType: file.type || 'application/octet-stream',
-      });
-      if (error) return { error: translateStorageError(error.message) };
-      onProgress?.(100);
-      const { data } = await sb().storage.from('chat-files').createSignedUrl(path, 60 * 60 * 24 * 7);
-      if (!data) return { error: 'Не удалось получить ссылку на файл' };
-      return {
-        name: file.name,
-        url: data.signedUrl,
-        storage_path: path,
-        size: file.size,
-        mime: file.type,
-        kind: file.type.startsWith('image/') ? ('image' as const) : ('file' as const),
-      };
-    } catch (e) {
-      return { error: (e as Error).message };
-    }
-  }
-
-  async startCall(callerId: string, calleeId: string, chatId: string, mode: CallMode) {
-    // заняты?
-    const { data: active } = await sb()
-      .from('calls')
-      .select('*')
-      .eq('callee_id', calleeId)
-      .in('status', ['ringing', 'accepted'])
-      .maybeSingle();
-    if (active) {
-      const { data: c } = await sb()
-        .from('calls')
-        .insert({ caller_id: callerId, callee_id: calleeId, chat_id: chatId, mode, status: 'failed' })
-        .select('*')
-        .single();
-      return c as Call;
-    }
-    const room = await this.createRoom(callerId, 'Личный звонок', mode);
-    const { data, error } = await sb()
-      .from('calls')
-      .insert({ caller_id: callerId, callee_id: calleeId, chat_id: chatId, room_id: room.id, mode })
-      .select('*')
-      .single();
-    if (error) throw new Error(error.message);
-    const call = data as Call;
-    await sb().from('call_events').insert({ callee_id: calleeId, caller_user_id: callerId, call_id: call.id, mode });
-    return call;
-  }
-  async getCall(callId: string) {
-    const { data } = await sb().from('calls').select('*').eq('id', callId).maybeSingle();
-    return data as Call | null;
-  }
-  async acceptCall(callId: string) {
-    const { error } = await sb().from('calls').update({ status: 'accepted' }).eq('id', callId).eq('status', 'ringing');
-    return { error: error?.message };
-  }
-  async declineCall(callId: string) {
-    await sb().from('calls').update({ status: 'declined', ended_at: new Date().toISOString() }).eq('id', callId);
-  }
-  async endCall(callId: string) {
-    await sb().from('calls').update({ status: 'ended', ended_at: new Date().toISOString() }).eq('id', callId);
-  }
-  async listCalls(userId: string) {
-    const { data } = await sb()
-      .from('calls')
-      .select('*, caller:profiles!calls_caller_id_fkey(id, display_name, avatar_url), callee:profiles!calls_callee_id_fkey(id, display_name, avatar_url)')
-      .or(`caller_id.eq.${userId},callee_id.eq.${userId}`)
-      .order('created_at', { ascending: false })
-      .limit(50);
-    return (data ?? []) as Call[];
-  }
-  subscribeIncomingCall(userId: string, cb: (e: IncomingCallEvent) => void) {
-    const ch = sb()
-      .channel(`call-events:${userId}`)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'call_events', filter: `callee_id=eq.${userId}` }, async (p) => {
-        const e = p.new as IncomingCallEvent;
-        const { data } = await sb().from('profiles').select('id, display_name, avatar_url').eq('id', e.caller_user_id).single();
-        cb({ ...e, caller: data });
-      })
-      .subscribe();
-    return () => {
-      sb().removeChannel(ch);
-    };
-  }
-  subscribeCallUpdates(userId: string, cb: (c: Call) => void) {
-    const ch = sb()
-      .channel(`calls:${userId}`)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'calls', filter: `callee_id=eq.${userId}` }, (p) => cb(p.new as Call))
-      .subscribe();
-    return () => {
-      sb().removeChannel(ch);
-    };
-  }
-
-  async createRoom(ownerId: string, title: string, mode: CallMode) {
-    const { data, error } = await sb().from('call_rooms').insert({ owner_id: ownerId, title, mode }).select('*').single();
-    if (error) throw new Error(error.message);
-    return data as CallRoom;
-  }
-  async getRoom(roomId: string) {
-    const { data } = await sb().from('call_rooms').select('*, owner:profiles!call_rooms_owner_id_fkey(id, display_name, avatar_url)').eq('id', roomId).maybeSingle();
-    return data as CallRoom | null;
-  }
-  async joinRoom(roomId: string, opts: { userId?: string | null; displayName: string }) {
-    const room = await this.getRoom(roomId);
-    if (!room) return { error: 'Комната не найдена' };
-    if (room.status === 'ended') return { error: 'Звонок уже завершён' };
-    const parts = await this.listParticipants(roomId);
-    const alive = parts.filter((p) => Date.now() - new Date(p.last_active).getTime() < 90_000);
-    if (alive.length >= room.max_participants) return { error: 'В комнате достигнут максимум участников' };
-    const { data, error } = await sb()
-      .from('room_participants')
-      .insert({ room_id: roomId, user_id: opts.userId ?? null, display_name: opts.displayName, is_host: opts.userId === room.owner_id })
-      .select('*')
-      .single();
+  async uploadChatFile(chatId: string, senderId: string, file: File, progress?: (p: number) => void): Promise<Attachment | { error: string }> {
+    if (file.size > APP_CONFIG.limits.maxFileSizeMb*1024*1024) return { error: 'Файл больше 15 МБ' };
+    const path = `${chatId}/${senderId}/${crypto.randomUUID()}`;
+    const { error } = await this.client.storage.from('chat-files').upload(path, file, { contentType: file.type || 'application/octet-stream' });
     if (error) return { error: error.message };
-    await sb().from('call_rooms').update({ status: 'active', updated_at: new Date().toISOString() }).eq('id', roomId);
-    return { participant: data as RoomParticipant };
+    progress?.(100);
+    return { name: file.name, url: '', storage_path: path, size: file.size, mime: file.type, kind: file.type.startsWith('image/') ? 'image' : 'file' };
   }
-  async leaveRoom(roomId: string, participantId: string) {
-    await sb().from('room_participants').delete().eq('id', participantId).eq('room_id', roomId);
+  async startCall(_caller: string, peer: string, chat: string, mode: CallMode) { return this.rpc<Call>('start_direct_call', { p_peer: peer, p_chat: chat, p_mode: mode }); }
+  async getCall(id: string) { const { data, error } = await this.client.from('calls').select('*').eq('id', id).maybeSingle(); fail(error); return data as Call | null; }
+  async acceptCall(id: string) { const { error } = await this.client.rpc('transition_call', { p_call: id, p_status: 'accepted' }); return { error: error?.message }; }
+  async declineCall(id: string) { await this.rpc('transition_call', { p_call: id, p_status: 'declined' }); }
+  async endCall(id: string) { await this.rpc('transition_call', { p_call: id, p_status: 'ended' }); }
+  async listCalls(user: string) {
+    const { data, error } = await this.client.from('calls').select('*,caller:profiles!calls_caller_id_fkey(id,display_name,avatar_url),callee:profiles!calls_callee_id_fkey(id,display_name,avatar_url)').or(`caller_id.eq.${user},callee_id.eq.${user}`).order('created_at', { ascending: false }).limit(50); fail(error); return (data ?? []) as Call[];
   }
-  async heartbeat(roomId: string, participantId: string) {
-    await sb().from('room_participants').update({ last_active: new Date().toISOString() }).eq('id', participantId).eq('room_id', roomId);
+  subscribeIncomingCall(user: string, cb: (e: IncomingCallEvent) => void) {
+    const seen = new Set<string>();
+    const refresh = () => { void this.listCalls(user).then(async list => { for (const c of list) if (c.callee_id === user && c.status === 'ringing' && Date.now()-Date.parse(c.created_at)<45000 && !seen.has(c.id)) { seen.add(c.id); cb({ id: 0, callee_id: user, caller_user_id: c.caller_id, call_id: c.id, mode: c.mode, created_at: c.created_at, caller: c.caller }); } }).catch(() => {}); };
+    const ch = this.client.channel('incoming:' + crypto.randomUUID()).on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'call_events', filter: 'callee_id=eq.' + user }, refresh);
+    return this.subscribe(ch, refresh, 5000);
   }
-  async listParticipants(roomId: string) {
-    const { data } = await sb()
-      .from('room_participants')
-      .select('*, user:profiles!room_participants_user_id_fkey(id, display_name, avatar_url)')
-      .eq('room_id', roomId);
-    return (data ?? []) as RoomParticipant[];
+  subscribeCallUpdates(user: string, cb: (c: Call) => void) {
+    const seen = new Map<string,string>();
+    const refresh = () => { void this.listCalls(user).then(list => { for (const c of list) { if (seen.get(c.id)!==c.status) { seen.set(c.id,c.status); cb(c); } } }).catch(() => {}); };
+    const ch = this.client.channel('calls:' + crypto.randomUUID()).on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'calls' }, refresh);
+    return this.subscribe(ch, refresh, 5000);
   }
-  async endRoom(roomId: string) {
-    await sb().from('call_rooms').update({ status: 'ended', ended_at: new Date().toISOString() }).eq('id', roomId);
-    await sb().from('room_participants').delete().eq('room_id', roomId);
+  async createRoom(_owner: string, title: string, mode: CallMode) { return this.rpc<CallRoom>('create_call_room', { p_title: title, p_mode: mode }); }
+  async getRoom(id: string) { return this.rpc<CallRoom | null>('get_invited_room', { p_room: id }); }
+  async joinRoom(id: string, opts: { userId?: string | null; displayName: string }) { const { data, error } = await this.client.rpc('join_call_room', { p_room: id, p_name: opts.displayName }); return { participant: error ? undefined : data as RoomParticipant, error: error?.message }; }
+  async leaveRoom(room: string, id: string) { await this.rpc('leave_call_room', { p_room: room, p_participant: id }); }
+  async heartbeat(room: string, id: string) { await this.rpc('heartbeat_call_room', { p_room: room, p_participant: id }); }
+  async listParticipants(id: string) { const { data, error } = await this.client.from('room_participants').select('*,user:profiles!room_participants_user_id_fkey(id,display_name,avatar_url)').eq('room_id', id).gt('last_active', new Date(Date.now()-90000).toISOString()); fail(error); return (data ?? []) as RoomParticipant[]; }
+  async endRoom(id: string) { await this.rpc('end_call_room', { p_room: id }); }
+  subscribeRoom(id: string, cb: () => void) {
+    const ch = this.client.channel('room:' + id + ':' + crypto.randomUUID())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'room_participants', filter: 'room_id=eq.' + id }, cb)
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'call_rooms', filter: 'id=eq.' + id }, cb);
+    return this.subscribe(ch, cb, 5000);
   }
-  subscribeRoom(roomId: string, cb: () => void) {
-    const ch = sb()
-      .channel(`room:${roomId}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'room_participants', filter: `room_id=eq.${roomId}` }, cb)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'call_rooms', filter: `id=eq.${roomId}` }, cb)
-      .subscribe();
-    return () => {
-      sb().removeChannel(ch);
-    };
-  }
-
-  async sendSignal(roomId: string, from: string, to: string | null, payload: SignalMessage['payload']) {
-    await sb().from('call_signals').insert({ room_id: roomId, sender_peer: from, target_peer: to, payload });
-  }
-  async getSignalsSince(roomId: string, sinceId: number) {
-    const { data } = await sb().from('call_signals').select('*').eq('room_id', roomId).gt('id', sinceId).order('id').limit(200);
-    return (data ?? []) as SignalMessage[];
-  }
-  subscribeSignals(roomId: string, selfPeer: string, cb: (s: SignalMessage) => void) {
-    const ch = sb()
-      .channel(`signals:${roomId}:${selfPeer}`)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'call_signals', filter: `room_id=eq.${roomId}` }, (p) => {
-        const s = p.new as SignalMessage;
-        if (s.sender_peer !== selfPeer && (s.target_peer === null || s.target_peer === selfPeer)) cb(s);
-      })
-      .subscribe();
-    return () => {
-      sb().removeChannel(ch);
-    };
+  async sendSignal(room: string, from: string, to: string | null, payload: SignalMessage['payload']) { const { error } = await this.client.from('call_signals').insert({ room_id: room, sender_peer: from, target_peer: to, payload }); fail(error); }
+  async getSignalsSince(room: string, since: number) { const { data, error } = await this.client.from('call_signals').select('*').eq('room_id', room).gt('id', since).order('id').limit(200); fail(error); return (data ?? []) as SignalMessage[]; }
+  subscribeSignals(room: string, self: string, cb: (s: SignalMessage) => void) {
+    const ch = this.client.channel('signals:' + crypto.randomUUID()).on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'call_signals', filter: 'room_id=eq.' + room }, p => { const s = p.new as SignalMessage; if (s.sender_peer!==self && (!s.target_peer || s.target_peer===self)) cb(s); }).subscribe();
+    return () => { void this.client.removeChannel(ch); };
   }
 }
-
-function translateAuthError(msg: string): string {
-  const m = msg.toLowerCase();
-  if (m.includes('invalid login credentials')) return 'Неверный e-mail или пароль';
-  if (m.includes('already registered') || m.includes('already exists')) return 'Пользователь с таким e-mail уже зарегистрирован';
-  if (m.includes('confirm')) return 'Подтвердите e-mail: мы отправили ссылку на вашу почту';
-  if (m.includes('rate limit')) return 'Слишком много попыток, попробуйте позже';
-  return msg;
+function authError(message: string) {
+  if (/invalid login credentials/i.test(message)) return 'Неверный e-mail или пароль';
+  if (/email not confirmed/i.test(message)) return 'Подтвердите e-mail по ссылке из письма';
+  if (/already registered|already exists|duplicate key|database error saving/i.test(message)) return 'E-mail или логин уже занят. Попробуйте другой';
+  if (/rate limit/i.test(message)) return 'Слишком много попыток. Попробуйте позже';
+  return message;
 }
-function translateStorageError(msg: string): string {
-  const m = msg.toLowerCase();
-  if (m.includes('exceeds maximum allowed size')) return 'Файл больше допустимого размера (15 МБ)';
-  return msg;
-}
-
-/* ============================ MOCK ============================ */
-
-
-
-/* ============================ EXPORT ============================ */
-
-export const backend: BackendApi = isSupabaseConfigured ? new SupabaseBackend() : new MockBackend(bc);
+export const backend: BackendApi = APP_CONFIG.demoMode ? new MockBackend(() => { try { return new BroadcastChannel('nexus-realtime'); } catch { return null; } }) : new SupabaseBackend(supabase!);
+export { isSupabaseConfigured };

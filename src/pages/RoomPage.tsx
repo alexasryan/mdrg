@@ -32,34 +32,30 @@ function makeBcTransport(roomId: string): SignalTransport {
 }
 
 function makeSbTransport(roomId: string): SignalTransport {
-  let lastId = 0;
-  void backend.getSignalsSince(roomId, 0).then((s) => s.length && (lastId = s[s.length - 1].id));
   return {
-    async send(from, to, payload) {
-      await backend.sendSignal(roomId, from, to, payload);
-    },
+    send: (from, to, payload) => backend.sendSignal(roomId, from, to, payload),
     subscribe(selfPeer, cb) {
-      const unsubRealtime = backend.subscribeSignals(roomId, selfPeer, (s) => {
-        if (s.id > lastId) {
-          lastId = s.id;
-          cb(s.sender_peer, s.payload as never);
-        }
-      });
-      // страховка на случай пропуска realtime-событий: периодический опрос
-      const poll = setInterval(async () => {
-        const list = await backend.getSignalsSince(roomId, lastId);
-        for (const s of list) {
-          if (s.id <= lastId) continue;
-          if (s.sender_peer !== selfPeer && (s.target_peer === null || s.target_peer === selfPeer)) {
-            lastId = s.id;
-            cb(s.sender_peer, s.payload as never);
-          } else lastId = s.id;
-        }
-      }, 4000);
-      return () => {
-        unsubRealtime();
-        clearInterval(poll);
+      let active = true;
+      let polling = false;
+      const startedAt = Date.now() - 5000;
+      const seen = new Set<number>();
+      let cursor = 0;
+      const deliver = (s: import('../types').SignalMessage) => {
+        if (!active || seen.has(s.id)) return;
+        seen.add(s.id);
+        if (Date.parse(s.created_at) >= startedAt && s.sender_peer !== selfPeer && (!s.target_peer || s.target_peer === selfPeer)) cb(s.sender_peer, s.payload as never);
       };
+      const unsub = backend.subscribeSignals(roomId, selfPeer, deliver);
+      const poll = async () => {
+        if (polling || !active) return;
+        polling = true;
+        try { const list = await backend.getSignalsSince(roomId, cursor); for (const s of list) { deliver(s); cursor = Math.max(cursor,s.id); } }
+        catch { /* Realtime and the next poll recover transient network failures. */ }
+        finally { polling = false; }
+      };
+      void poll();
+      const timer = setInterval(() => void poll(), 1500);
+      return () => { active = false; unsub(); clearInterval(timer); };
     },
   };
 }
@@ -168,8 +164,8 @@ export default function RoomPage() {
   // подписка на изменения состава + heartbeat
   useEffect(() => {
     if (phase !== 'in-call') return;
-    void refreshParticipants();
-    const unsub = backend.subscribeRoom(dataRoomId, () => void refreshParticipants());
+    void refreshParticipants().catch(() => {});
+    const unsub = backend.subscribeRoom(dataRoomId, () => { void refreshParticipants().catch(() => {}); });
     hbRef.current = window.setInterval(async () => {
       const p = myPeer;
       if (p) await backend.heartbeat(dataRoomId, p).catch(() => {});
@@ -179,6 +175,19 @@ export default function RoomPage() {
       if (hbRef.current) clearInterval(hbRef.current);
     };
   }, [phase, dataRoomId, myPeer, refreshParticipants]);
+
+  useEffect(() => {
+    if (phase !== 'in-call' || !isDirect) return;
+    let active = true;
+    let stop: (() => void) | undefined;
+    void backend.getSessionUserId().then(id => {
+      if (!active || !id) return;
+      stop = backend.subscribeCallUpdates(id, c => {
+        if (c.id === callId && ['ended','declined','missed','failed'].includes(c.status)) void leaveCall('Собеседник завершил звонок').catch(() => {});
+      });
+    }).catch(() => {});
+    return () => { active = false; stop?.(); };
+  }, [phase, isDirect, callId]);
 
   // таймер разговора
   useEffect(() => {
@@ -248,10 +257,11 @@ export default function RoomPage() {
 
       // при появлении новых участников — создаём соединения
       const unsub = backend.subscribeRoom(dataRoomId, () => {
+        void backend.getRoom(dataRoomId).then(r => { if (r?.status === 'ended') { setPhase('ended'); void hardCleanup(); } }).catch(() => {});
         void backend.listParticipants(dataRoomId).then((list) => {
           setParticipants(list);
           for (const id of [...remoteStreams.current.keys()]) if (!list.some((p) => p.id === id)) mgr.handlePeerLeft(id);
-        });
+        }).catch(() => {});
       });
 
       setPhase('in-call');
@@ -261,7 +271,7 @@ export default function RoomPage() {
         const metaRaw = sessionStorage.getItem('nexus-active-call');
         if (metaRaw) {
           const meta: ActiveCallMeta = JSON.parse(metaRaw);
-          if (meta.role === 'callee') void backend.acceptCall(meta.callId);
+          if (meta.role === 'callee') { const c = await backend.getCall(meta.callId); if (c?.status === 'ringing') await backend.acceptCall(meta.callId); }
         }
       }
     } catch (e) {
@@ -287,12 +297,12 @@ export default function RoomPage() {
       if (metaRaw) {
         const meta: ActiveCallMeta = JSON.parse(metaRaw);
         const call = await backend.getCall(meta.callId);
-        if (call && (call.status === 'ringing' || call.status === 'accepted')) await backend.endCall(meta.callId);
+        if (call && (call.status === 'ringing' || call.status === 'accepted')) await backend.endCall(meta.callId).catch(() => {});
       }
       sessionStorage.removeItem('nexus-active-call');
     }
     // если мы последний живой участник — закрываем комнату
-    const remaining = await backend.listParticipants(dataRoomId);
+    const remaining = await backend.listParticipants(dataRoomId).catch(() => []);
     if (!remaining.length) await backend.endRoom(dataRoomId).catch(() => {});
   }
 
