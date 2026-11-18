@@ -31,11 +31,6 @@ jobs:
       - run: npx playwright install --with-deps chromium
       - name: Test the production build in a browser
         run: npm run test:browser
-      - name: Select GitHub Actions as the Pages publishing source
-        if: github.event_name != 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh api --method PUT "repos/$GITHUB_REPOSITORY/pages" -f build_type=workflow
       - uses: actions/configure-pages@v5
         if: github.event_name != 'pull_request'
       - uses: actions/upload-pages-artifact@v4
